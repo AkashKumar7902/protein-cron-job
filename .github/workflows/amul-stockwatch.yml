@@ -1,0 +1,236 @@
+name: Amul Stock Watch (Email)
+
+on:
+  schedule:
+    # Every hour (GitHub cron uses UTC; IST = UTC+5:30)
+    - cron: "0 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+    # Need write to persist state file
+    permissions:
+      contents: write
+    env:
+      BASE_URL: https://shop.amul.com
+      STATE_FILE: .github/amul-stock-state.json
+      # Default tracked aliases (overridden by .github/amul-tracklist.txt if present)
+      TRACKLIST: >-
+        amul-chocolate-whey-protein-34-g-or-pack-of-60-sachets,
+        amul-whey-protein-32-g-or-pack-of-60-sachets,
+        amul-high-protein-buttermilk-200-ml-or-pack-of-30
+    steps:
+      - name: Checkout (required to read/write state file + optional tracklist)
+        uses: actions/checkout@v4
+
+      - name: Ensure jq
+        run: |
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y jq
+          fi
+
+      - name: Load tracklist (file overrides env)
+        run: |
+          if [ -f ".github/amul-tracklist.txt" ]; then
+            echo "Using .github/amul-tracklist.txt"
+            TRACKLIST=$(grep -v '^\s*#' .github/amul-tracklist.txt | grep -v '^\s*$' | tr '\n' ',' | sed 's/,$//')
+          else
+            echo "Using env TRACKLIST"
+          fi
+          echo "TRACKLIST=$TRACKLIST" >> $GITHUB_ENV
+
+      - name: Load previous state (for dedup)
+        run: |
+          if [ -f "$STATE_FILE" ]; then
+            cp "$STATE_FILE" prev_state.json
+            echo "Loaded previous state from $STATE_FILE"
+          else
+            echo '{}' > prev_state.json
+            echo "No previous state; starting fresh."
+          fi
+          cat prev_state.json
+
+      # Encoded query (avoids [] globbing issues)
+      - name: Fetch Amul products (encoded)
+        env:
+          AMUL_COOKIE: ${{ secrets.AMUL_COOKIE }} # optional cookie if needed
+        run: |
+          set -euo pipefail
+          BASE='https://shop.amul.com/api/1/entity/ms.products'
+          hdrs=(
+            -H 'accept: application/json, text/plain, */*'
+            -H 'frontend: 1'
+            -H 'referer: https://shop.amul.com/'
+            -H 'base_url: https://shop.amul.com/en/browse/protein'
+          )
+          if [ -n "${AMUL_COOKIE:-}" ]; then
+            hdrs+=(-H "cookie: ${AMUL_COOKIE}")
+          fi
+
+          curl -sS --get "$BASE" "${hdrs[@]}" \
+            --data-urlencode 'fields[name]=1' \
+            --data-urlencode 'fields[brand]=1' \
+            --data-urlencode 'fields[categories]=1' \
+            --data-urlencode 'fields[collections]=1' \
+            --data-urlencode 'fields[alias]=1' \
+            --data-urlencode 'fields[sku]=1' \
+            --data-urlencode 'fields[price]=1' \
+            --data-urlencode 'fields[compare_price]=1' \
+            --data-urlencode 'fields[original_price]=1' \
+            --data-urlencode 'fields[images]=1' \
+            --data-urlencode 'fields[metafields]=1' \
+            --data-urlencode 'fields[discounts]=1' \
+            --data-urlencode 'fields[catalog_only]=1' \
+            --data-urlencode 'fields[is_catalog]=1' \
+            --data-urlencode 'fields[seller]=1' \
+            --data-urlencode 'fields[available]=1' \
+            --data-urlencode 'fields[inventory_quantity]=1' \
+            --data-urlencode 'fields[net_quantity]=1' \
+            --data-urlencode 'fields[num_reviews]=1' \
+            --data-urlencode 'fields[avg_rating]=1' \
+            --data-urlencode 'fields[inventory_low_stock_quantity]=1' \
+            --data-urlencode 'fields[inventory_allow_out_of_stock]=1' \
+            --data-urlencode 'fields[default_variant]=1' \
+            --data-urlencode 'fields[variants]=1' \
+            --data-urlencode 'fields[lp_seller_ids]=1' \
+            --data-urlencode 'filters[0][field]=categories' \
+            --data-urlencode 'filters[0][value][0]=protein' \
+            --data-urlencode 'filters[0][operator]=in' \
+            --data-urlencode 'filters[0][original]=1' \
+            --data-urlencode 'facets=true' \
+            --data-urlencode 'facetgroup=default_category_facet' \
+            --data-urlencode 'limit=32' \
+            --data-urlencode 'total=1' \
+            --data-urlencode 'start=0' \
+            --data-urlencode 'cdc=1m' \
+            --data-urlencode 'substore=66505ff0998183e1b1935c75' \
+            -o response.json
+
+          jq -r '.data | length' response.json | xargs -I{} echo "Fetched {} products"
+
+      - name: Filter tracked products & build states (current + diff)
+        id: states
+        run: |
+          set -euo pipefail
+          IFS=',' read -ra aliases <<< "$TRACKLIST"
+          results="[]"
+          for alias in "${aliases[@]}"; do
+            alias=$(echo "$alias" | xargs)
+            [ -z "$alias" ] && continue
+            item=$(jq --arg a "$alias" -c '
+              .data[] | select(.alias == $a or ((.name|ascii_downcase) | contains($a)))
+            ' response.json | head -n 1 || true)
+            if [ -n "${item:-}" ]; then
+              results=$(jq -c --argjson itm "$item" '. + [$itm]' <<<"$results")
+            else
+              echo "::warning::Alias not found in feed: $alias"
+            fi
+          done
+          echo "$results" > tracked.json
+
+          echo "→ Tracked aliases matched:"
+          jq -r '.[] | "\(.alias) | \(.name)"' tracked.json || true
+
+          # current_state.json : { "<alias>": true|false }
+          jq -c '
+            map({alias, available: (.available==1), qty: (.inventory_quantity // 0)}) as $arr
+            | reduce $arr[] as $p ({}; .[$p.alias] = ($p.available and ($p.qty>0)))
+          ' tracked.json > current_state.json
+
+          echo "→ Current state:"
+          cat current_state.json
+
+          # new_aliases.json : ["alias1","alias2",... newly in-stock vs prev_state.json]
+          jq -n --slurpfile curr current_state.json --slurpfile prev prev_state.json '
+            ($curr[0] // {}) as $c |
+            ($prev[0] // {}) as $p |
+            [ keys($c)[] | select(($c[.] == true) and ($p[.] != true)) ]
+          ' > new_aliases.json
+
+          echo "→ Newly in-stock aliases:"
+          cat new_aliases.json
+
+          # Build human lines for NEWLY in-stock only
+          NEW_LINES=$(jq -r --argjson NEW "$(cat new_aliases.json)" '
+            .[] | select(.alias as $a | $NEW | index($a)) |
+            "\(.name) — \(.inventory_quantity) in stock | ₹\(.price) | https://shop.amul.com/en/product/\(.alias)"
+          ' tracked.json || true)
+
+          printf "%s\n" "$NEW_LINES" > newly_in_stock.txt || true
+
+          new_count=$(grep -c . newly_in_stock.txt || true)
+          echo "new_count=$new_count" >> "$GITHUB_OUTPUT"
+
+          # For logs only: what is currently in stock (not used for email)
+          jq -r '
+            .[] | select((.available == 1) and ((.inventory_quantity // 0) > 0)) |
+            "\(.name) — \(.inventory_quantity) in stock"
+          ' tracked.json > current_in_stock.txt || true
+          echo "→ Currently in stock (for logs):"
+          cat current_in_stock.txt || true
+
+      - name: Prepare email (subject + HTML body) — only on NEW stock
+        if: steps.states.outputs.new_count != '0'
+        run: |
+          set -euo pipefail
+          SUBJECT="Amul stock alert: $(wc -l < newly_in_stock.txt) item(s) newly in stock"
+
+          # Build HTML list for NEWLY in-stock items
+          NEW_JSON=$(cat new_aliases.json)
+          HTML_START="<p>🔔 <strong>Amul stock alert</strong> — new availability detected</p><ul>"
+          HTML_ITEMS=$(jq -r --argjson NEW "$NEW_JSON" '
+            .[] | select(.alias as $a | $NEW | index($a)) |
+            "<li><a href=\"https://shop.amul.com/en/product/"+.alias+"\">" +
+            (.name|gsub("&";"&amp;")) + "</a> — " +
+            ((.inventory_quantity|tostring)) + " in stock | ₹" +
+            ((.price|tostring)) + "</li>"
+          ' tracked.json)
+          HTML_END="</ul>"
+
+          {
+            echo "EMAIL_SUBJECT<<EOF"
+            echo "$SUBJECT"
+            echo "EOF"
+            echo "EMAIL_BODY<<EOF"
+            echo "$HTML_START"
+            echo "$HTML_ITEMS"
+            echo "$HTML_END"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Send email
+        if: steps.states.outputs.new_count != '0'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ env.EMAIL_SUBJECT }}
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+          html_body: ${{ env.EMAIL_BODY }}
+
+      - name: No NEW in-stock items (dedup guard)
+        if: steps.states.outputs.new_count == '0'
+        run: |
+          echo "No newly in-stock items since the last run (dedup guard)."
+          echo "Currently in-stock (for visibility):"
+          cat current_in_stock.txt || true
+
+      - name: Persist current state
+        # Always update the state file so the next run compares against this one
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$STATE_FILE")"
+          if [ -f "$STATE_FILE" ] && diff -q "$STATE_FILE" current_state.json >/dev/null; then
+            echo "State unchanged; nothing to commit."
+            exit 0
+          fi
+          cp current_state.json "$STATE_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          git commit -m "Update Amul stock state [skip ci]" || { echo "Nothing to commit"; exit 0; }
+          git push
