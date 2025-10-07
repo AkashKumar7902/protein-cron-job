@@ -9,19 +9,20 @@ on:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    # Need write to persist state file
+    # Need write to persist state files
     permissions:
       contents: write
     env:
       BASE_URL: https://shop.amul.com
-      STATE_FILE: .github/amul-stock-state.json
+      STOCK_STATE_FILE: .github/amul-stock-state.json
+      STATUS_FILE: .github/amul-workflow-status.json
       # Default tracked aliases (overridden by .github/amul-tracklist.txt if present)
       TRACKLIST: >-
         amul-chocolate-whey-protein-34-g-or-pack-of-60-sachets,
         amul-whey-protein-32-g-or-pack-of-60-sachets,
         amul-high-protein-buttermilk-200-ml-or-pack-of-30
     steps:
-      - name: Checkout (required to read/write state file + optional tracklist)
+      - name: Checkout (required to read/write state files + optional tracklist)
         uses: actions/checkout@v4
 
       - name: Ensure jq
@@ -40,14 +41,14 @@ jobs:
           fi
           echo "TRACKLIST=$TRACKLIST" >> $GITHUB_ENV
 
-      - name: Load previous state (for dedup)
+      - name: Load previous stock state (for dedup)
         run: |
-          if [ -f "$STATE_FILE" ]; then
-            cp "$STATE_FILE" prev_state.json
-            echo "Loaded previous state from $STATE_FILE"
+          if [ -f "$STOCK_STATE_FILE" ]; then
+            cp "$STOCK_STATE_FILE" prev_state.json
+            echo "Loaded previous stock state from $STOCK_STATE_FILE"
           else
             echo '{}' > prev_state.json
-            echo "No previous state; starting fresh."
+            echo "No previous stock state; starting fresh."
           fi
           cat prev_state.json
 
@@ -138,7 +139,7 @@ jobs:
             | reduce $arr[] as $p ({}; .[$p.alias] = ($p.available and ($p.qty>0)))
           ' tracked.json > current_state.json
 
-          echo "→ Current state:"
+          echo "→ Current stock state:"
           cat current_state.json
 
           # new_aliases.json : ["alias1","alias2",... newly in-stock vs prev_state.json]
@@ -219,18 +220,78 @@ jobs:
           echo "Currently in-stock (for visibility):"
           cat current_in_stock.txt || true
 
-      - name: Persist current state
-        # Always update the state file so the next run compares against this one
+      - name: Persist state files
+        # Always update state files so the next run compares against this one.
+        # This step also writes the success status to reset the failure alert dedup guard.
         run: |
           set -euo pipefail
-          mkdir -p "$(dirname "$STATE_FILE")"
-          if [ -f "$STATE_FILE" ] && diff -q "$STATE_FILE" current_state.json >/dev/null; then
-            echo "State unchanged; nothing to commit."
-            exit 0
-          fi
-          cp current_state.json "$STATE_FILE"
+          mkdir -p "$(dirname "$STOCK_STATE_FILE")"
+
+          # Write current stock state
+          cp current_state.json "$STOCK_STATE_FILE"
+          
+          # Write success status for the workflow run
+          echo '{"status": "success"}' > "$STATUS_FILE"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$STATE_FILE"
-          git commit -m "Update Amul stock state [skip ci]" || { echo "Nothing to commit"; exit 0; }
+          
+          # Add both files to be committed
+          git add "$STOCK_STATE_FILE" "$STATUS_FILE"
+          
+          # Commit if there are any changes to either file
+          git commit -m "Update Amul stock and workflow status [skip ci]" || { echo "No state changes to commit."; exit 0; }
+          git push
+
+  notify-on-failure:
+    runs-on: ubuntu-latest
+    needs: check-stock
+    if: failure()
+    permissions:
+      contents: write # To update the failure status
+    env:
+      STATUS_FILE: .github/amul-workflow-status.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check failure dedup guard
+        id: dedup
+        run: |
+          # Default to sending notification if status file doesn't exist
+          if ! [ -f "$STATUS_FILE" ] || [ "$(jq -r .status "$STATUS_FILE")" != "failure" ]; then
+            echo "This is a new failure. Notification will be sent."
+            echo "send_notification=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "A failure has already been reported for the previous run. Suppressing notification."
+            echo "send_notification=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send failure email
+        if: steps.dedup.outputs.send_notification == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "🚨 Workflow Failure: Amul Stock Watch"
+          to: ${{ secrets.EMAIL_TO }}
+          from: ${{ secrets.EMAIL_FROM }}
+          html_body: |
+            The 'Amul Stock Watch' workflow has failed.
+            <br/><br/>
+            Please check the run logs for details:
+            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}</a>
+
+      - name: Persist failure state
+        if: steps.dedup.outputs.send_notification == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$STATUS_FILE")"
+          echo '{"status": "failure"}' > "$STATUS_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$STATUS_FILE"
+          git commit -m "Update workflow status to failure [skip ci]"
           git push
