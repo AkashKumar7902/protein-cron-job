@@ -145,7 +145,7 @@ jobs:
           jq -n --slurpfile curr current_state.json --slurpfile prev prev_state.json '
             ($curr[0] // {}) as $c |
             ($prev[0] // {}) as $p |
-            [ keys($c)[] | select(($c[.] == true) and ($p[.] != true)) ]
+            [ ($c | keys)[] | select(($c[.] == true) and ($p[.] != true)) ]
           ' > new_aliases.json
 
           echo "→ Newly in-stock aliases:"
