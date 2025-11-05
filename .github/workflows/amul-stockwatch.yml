@@ -267,22 +267,22 @@ jobs:
             echo "send_notification=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Send failure email
-        if: steps.dedup.outputs.send_notification == 'true'
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: ${{ secrets.SMTP_SERVER }}
-          server_port: ${{ secrets.SMTP_PORT }}
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: "🚨 Workflow Failure: Amul Stock Watch"
-          to: ${{ secrets.EMAIL_TO }}
-          from: ${{ secrets.EMAIL_FROM }}
-          html_body: |
-            The 'Amul Stock Watch' workflow has failed.
-            <br/><br/>
-            Please check the run logs for details:
-            <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}</a>
+      # - name: Send failure email
+      #   if: steps.dedup.outputs.send_notification == 'true'
+      #   uses: dawidd6/action-send-mail@v3
+      #   with:
+      #     server_address: ${{ secrets.SMTP_SERVER }}
+      #     server_port: ${{ secrets.SMTP_PORT }}
+      #     username: ${{ secrets.SMTP_USERNAME }}
+      #     password: ${{ secrets.SMTP_PASSWORD }}
+      #     subject: "🚨 Workflow Failure: Amul Stock Watch"
+      #     to: ${{ secrets.EMAIL_TO }}
+      #     from: ${{ secrets.EMAIL_FROM }}
+      #     html_body: |
+      #       The 'Amul Stock Watch' workflow has failed.
+      #       <br/><br/>
+      #       Please check the run logs for details:
+      #       <a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}</a>
 
       - name: Persist failure state
         if: steps.dedup.outputs.send_notification == 'true'
