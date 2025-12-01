@@ -41,6 +41,17 @@ jobs:
           fi
           echo "TRACKLIST=$TRACKLIST" >> $GITHUB_ENV
 
+      - name: Load email list (file overrides secret)
+        run: |
+          if [ -f ".github/amul-emaillist.txt" ]; then
+            echo "Using .github/amul-emaillist.txt"
+            EMAIL_TO=$(grep -v '^\s*#' .github/amul-emaillist.txt | grep -v '^\s*$' | tr '\n' ',' | sed 's/,$//')
+            echo "EMAIL_TO=$EMAIL_TO" >> $GITHUB_ENV
+          else
+            echo "Using secret EMAIL_TO"
+            echo "EMAIL_TO=${{ secrets.EMAIL_TO }}" >> $GITHUB_ENV
+          fi
+
       - name: Load previous stock state (for dedup)
         run: |
           if [ -f "$STOCK_STATE_FILE" ]; then
@@ -209,7 +220,7 @@ jobs:
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
           subject: ${{ env.EMAIL_SUBJECT }}
-          to: ${{ secrets.EMAIL_TO }}
+          to: ${{ env.EMAIL_TO }}
           from: ${{ secrets.EMAIL_FROM }}
           html_body: ${{ env.EMAIL_BODY }}
 
