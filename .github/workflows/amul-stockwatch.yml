@@ -9,18 +9,21 @@ on:
 jobs:
   check-stock:
     runs-on: ubuntu-latest
-    # Need write to persist state files
+    # contents: write persists state files; actions: write re-enables this workflow
+    # (GitHub disables scheduled workflows after 60 days without repo activity)
     permissions:
       contents: write
+      actions: write
     env:
       BASE_URL: https://shop.amul.com
+      # Amul's storefront ids; the site signs every request with the store id
+      # and only lists products once a delivery substore is set on the session
+      AMUL_STORE_ID: 62fa94df8c13af2e242eba16
+      AMUL_SUBSTORE_ID: 66505ff0998183e1b1935c75
       STOCK_STATE_FILE: .github/amul-stock-state.json
       STATUS_FILE: .github/amul-workflow-status.json
       # Default tracked aliases (overridden by .github/amul-tracklist.txt if present)
-      TRACKLIST: >-
-        amul-chocolate-whey-protein-34-g-or-pack-of-60-sachets,
-        amul-whey-protein-32-g-or-pack-of-60-sachets,
-        amul-high-protein-plain-lassi-200-ml-or-pack-of-30
+      TRACKLIST: amul-high-protein-plain-lassi-200-ml-or-pack-of-30
     steps:
       - name: Checkout (required to read/write state files + optional tracklist)
         uses: actions/checkout@v4
@@ -63,24 +66,45 @@ jobs:
           fi
           cat prev_state.json
 
+      # Amul's API rejects calls without a browser-like session: the storefront
+      # loads the page (jsessionid cookie + serverTimestamp), reads session.tid from
+      # /user/info.js, signs each request as tid = ts:rand:sha256(store:ts:rand:sessionTid),
+      # and sets the delivery substore on the session before listing products.
       # Encoded query (avoids [] globbing issues)
       - name: Fetch Amul products (encoded)
-        env:
-          AMUL_COOKIE: ${{ secrets.AMUL_COOKIE }} # optional cookie if needed
         run: |
           set -euo pipefail
-          BASE='https://shop.amul.com/api/1/entity/ms.products'
+          PAGE='https://shop.amul.com/en/browse/protein'
+          UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36'
+          JAR=$(mktemp)
+
+          html=$(curl -sS --fail -c "$JAR" -A "$UA" "$PAGE")
+          server_ts=$(grep -o 'serverTimestamp = "[0-9]*"' <<<"$html" | grep -o '[0-9]\{6,\}' || true)
+          [ -n "$server_ts" ] || { echo "::error::serverTimestamp not found on $PAGE"; exit 1; }
+
+          session_tid=$(curl -sS --fail -b "$JAR" -c "$JAR" -A "$UA" -e "$PAGE" \
+            "$BASE_URL/user/info.js?_v=$server_ts" | grep -o '"tid":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+          [ -n "$session_tid" ] || { echo "::error::session tid not found in /user/info.js"; exit 1; }
+
+          signed_tid() {
+            local rnd=$((RANDOM % 1000))
+            echo "$server_ts:$rnd:$(printf '%s' "$AMUL_STORE_ID:$server_ts:$rnd:$session_tid" | sha256sum | cut -d' ' -f1)"
+          }
+
           hdrs=(
             -H 'accept: application/json, text/plain, */*'
             -H 'frontend: 1'
-            -H 'referer: https://shop.amul.com/'
-            -H 'base_url: https://shop.amul.com/en/browse/protein'
+            -H "referer: $PAGE"
+            -H "base_url: $PAGE"
           )
-          if [ -n "${AMUL_COOKIE:-}" ]; then
-            hdrs+=(-H "cookie: ${AMUL_COOKIE}")
-          fi
 
-          curl -sS --get "$BASE" "${hdrs[@]}" \
+          curl -sS --fail -b "$JAR" -c "$JAR" -A "$UA" -X PUT "$BASE_URL/entity/ms.settings/_/setPreferences" \
+            "${hdrs[@]}" -H 'content-type: application/json' -H "tid: $(signed_tid)" \
+            --data "{\"data\":{\"substore_id\":\"$AMUL_SUBSTORE_ID\"}}"
+          echo
+
+          curl -sS --fail -b "$JAR" -c "$JAR" -A "$UA" --get "$BASE_URL/api/1/entity/ms.products" \
+            "${hdrs[@]}" -H "tid: $(signed_tid)" \
             --data-urlencode 'fields[name]=1' \
             --data-urlencode 'fields[brand]=1' \
             --data-urlencode 'fields[categories]=1' \
@@ -115,11 +139,16 @@ jobs:
             --data-urlencode 'limit=32' \
             --data-urlencode 'total=1' \
             --data-urlencode 'start=0' \
-            --data-urlencode 'cdc=1m' \
-            --data-urlencode 'substore=66505ff0998183e1b1935c75' \
             -o response.json
 
-          jq -r '.data | length' response.json | xargs -I{} echo "Fetched {} products"
+          # The API answers 200 with "data": [] when no substore is set on the session
+          fetched=$(jq -r '.data | length' response.json)
+          total=$(jq -r '.paging.total' response.json)
+          echo "Fetched $fetched of $total products"
+          if [ "$fetched" -eq 0 ] || [ "$fetched" -lt "$total" ]; then
+            echo "::error::Amul returned $fetched of $total products"
+            exit 1
+          fi
 
       - name: Filter tracked products & build states (current + diff)
         id: states
@@ -136,7 +165,8 @@ jobs:
             if [ -n "${item:-}" ]; then
               results=$(jq -c --argjson itm "$item" '. + [$itm]' <<<"$results")
             else
-              echo "::warning::Alias not found in feed: $alias"
+              echo "::error::Alias not found in feed: $alias"
+              exit 1
             fi
           done
           echo "$results" > tracked.json
@@ -253,6 +283,15 @@ jobs:
           # Commit if there are any changes to either file
           git commit -m "Update Amul stock and workflow status [skip ci]" || { echo "No state changes to commit."; exit 0; }
           git push
+
+      # State only changes when stock flips, so a quiet stretch would let GitHub
+      # disable this schedule after 60 days; re-enabling resets that timer.
+      - name: Keep scheduled workflow enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        # By file name: `gh workflow enable` only resolves workflow *names* among disabled ones
+        run: gh workflow enable amul-stockwatch.yml
 
   notify-on-failure:
     runs-on: ubuntu-latest
